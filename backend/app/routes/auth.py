@@ -1,3 +1,5 @@
+import re
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
@@ -44,10 +46,37 @@ async def register_user(request: RegisterRequest):
             detail="Username must contain at least 3 characters"
         )
 
-    if len(request.password) < 6:
+    if len(request.password) < 8:
         raise HTTPException(
             status_code=400,
-            detail="Password must contain at least 6 characters"
+            detail="Password must contain at least 8 characters"
+        )
+
+    if not re.search(r"[A-Z]", request.password):
+        raise HTTPException(
+            status_code=400,
+            detail="Password must contain at least one uppercase letter"
+        )
+
+    if not re.search(r"[a-z]", request.password):
+        raise HTTPException(
+            status_code=400,
+            detail="Password must contain at least one lowercase letter"
+        )
+
+    if not re.search(r"\d", request.password):
+        raise HTTPException(
+            status_code=400,
+            detail="Password must contain at least one number"
+        )
+
+    if not re.search(
+        r"[!@#$%^&*(),.?\":{}|<>_\-]",
+        request.password
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Password must contain at least one special character"
         )
 
     existing_user = await db.users.find_one({

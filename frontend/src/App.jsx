@@ -1,6 +1,5 @@
 import { useEffect, useState } from "react"
 
-
 const API = "http://127.0.0.1:8000"
 
 
@@ -26,6 +25,7 @@ function Login({ onLogin }) {
     if (!username.trim() || !password) {
 
       setError("Enter username and password")
+
       return
 
     }
@@ -284,9 +284,14 @@ function App() {
 
   const [loading, setLoading] = useState(true)
   const [selectedAlert, setSelectedAlert] = useState(null)
-
+  const [alertActivity, setAlertActivity] = useState([])
+  const [activityLoading, setActivityLoading] = useState(false)
+  const [analystNote, setAnalystNote] = useState("")
+  const [noteSubmitting, setNoteSubmitting] = useState(false)
+  const [noteMessage, setNoteMessage] = useState("")
   const [search, setSearch] = useState("")
   const [severityFilter, setSeverityFilter] = useState("ALL")
+  const [statusFilter, setStatusFilter] = useState("ALL")
 
   const [selectedFile, setSelectedFile] = useState(null)
   const [uploading, setUploading] = useState(false)
@@ -509,43 +514,139 @@ function App() {
     }
 
   }, [authenticated])
-
-
   /* ============================================================
-     WEBSOCKET - REAL TIME ALERTS
-  ============================================================ */
+   WEBSOCKET - JWT AUTHENTICATED REAL TIME ALERTS
+   AUTO RECONNECT
+============================================================ */
 
-  useEffect(() => {
+useEffect(() => {
 
-    if (!authenticated) {
+  if (!authenticated) {
+
+    setWebsocketConnected(false)
+
+    return
+
+  }
+
+
+  const token =
+    localStorage.getItem(
+      "sentinel_token"
+    )
+
+
+  if (!token) {
+
+    console.error(
+      "WebSocket authentication token missing"
+    )
+
+    setWebsocketConnected(false)
+
+    return
+
+  }
+
+
+  let websocket = null
+  let reconnectTimer = null
+  let reconnectAttempts = 0
+  let isClosing = false
+
+
+  const connectWebSocket = () => {
+
+    if (isClosing) {
       return
     }
 
 
-    const websocket =
+    console.log(
+      `Connecting to Sentinel WebSocket... attempt ${
+        reconnectAttempts + 1
+      }`
+    )
+
+
+    websocket =
       new WebSocket(
         "ws://127.0.0.1:8000/ws"
       )
 
 
+    /* ========================================================
+       CONNECTION OPEN
+    ======================================================== */
+
     websocket.onopen = () => {
 
       console.log(
-        "Sentinel WebSocket connected"
+        "WebSocket connection established"
       )
 
-      setWebsocketConnected(true)
+
+      /*
+      Send JWT to the backend.
+
+      The backend will validate this token
+      before allowing live alert traffic.
+      */
+
+      websocket.send(
+        JSON.stringify({
+          type: "AUTH",
+          token: token
+        })
+      )
 
     }
 
+
+    /* ========================================================
+       MESSAGE HANDLER
+    ======================================================== */
 
     websocket.onmessage = (event) => {
 
       try {
 
         const data =
-          JSON.parse(event.data)
+          JSON.parse(
+            event.data
+          )
 
+
+        /* ==================================================
+           AUTHENTICATION SUCCESS
+        ================================================== */
+
+        if (
+          data.type ===
+          "AUTHENTICATED"
+        ) {
+
+          console.log(
+            `Sentinel WebSocket authenticated as ${data.username}`
+          )
+
+
+          reconnectAttempts = 0
+
+
+          setWebsocketConnected(
+            true
+          )
+
+
+          return
+
+        }
+
+
+        /* ==================================================
+           NEW SECURITY ALERT
+        ================================================== */
 
         if (
           data.type === "NEW_ALERT" &&
@@ -553,13 +654,19 @@ function App() {
         ) {
 
           const newAlert = {
+
             ...data.alert,
 
             _id:
               data.alert._id ||
               `live-${Date.now()}`
+
           }
 
+
+          /*
+          Prevent duplicate live alerts.
+          */
 
           setAlerts(
             (currentAlerts) => {
@@ -567,12 +674,15 @@ function App() {
               const exists =
                 currentAlerts.some(
                   (alert) =>
-                    alert._id === newAlert._id
+                    alert._id ===
+                    newAlert._id
                 )
 
 
               if (exists) {
+
                 return currentAlerts
+
               }
 
 
@@ -585,6 +695,12 @@ function App() {
           )
 
 
+          /*
+          Update dashboard statistics
+          immediately without waiting
+          for the polling request.
+          */
+
           setStats(
             (currentStats) => ({
 
@@ -593,19 +709,31 @@ function App() {
               total_alerts:
                 currentStats.total_alerts + 1,
 
+
               active_alerts:
-                newAlert.status === "DETECTED"
+                newAlert.status ===
+                "DETECTED"
+
                   ? currentStats.active_alerts + 1
+
                   : currentStats.active_alerts,
 
+
               high_severity:
-                newAlert.severity === "HIGH"
+                newAlert.severity ===
+                "HIGH"
+
                   ? currentStats.high_severity + 1
+
                   : currentStats.high_severity,
 
+
               medium_severity:
-                newAlert.severity === "MEDIUM"
+                newAlert.severity ===
+                "MEDIUM"
+
                   ? currentStats.medium_severity + 1
+
                   : currentStats.medium_severity
 
             })
@@ -631,741 +759,1026 @@ function App() {
     }
 
 
-    websocket.onerror = (error) => {
+    /* ========================================================
+       WEBSOCKET ERROR
+    ======================================================== */
+
+    websocket.onerror = (
+      error
+    ) => {
 
       console.error(
         "Sentinel WebSocket error:",
         error
       )
 
-      setWebsocketConnected(false)
 
-    }
-
-
-    websocket.onclose = () => {
-
-      console.log(
-        "Sentinel WebSocket disconnected"
+      setWebsocketConnected(
+        false
       )
 
-      setWebsocketConnected(false)
+    }
+
+
+    /* ========================================================
+       WEBSOCKET CLOSED
+    ======================================================== */
+
+    websocket.onclose = (
+  event
+) => {
+
+  console.log(
+    "Sentinel WebSocket disconnected",
+    event.code,
+    event.reason
+  )
+
+  setWebsocketConnected(false)
+
+  if (isClosing) {
+    return
+  }
+
+  if (
+    event.code === 1008 &&
+    event.reason ===
+      "Invalid or expired token"
+  ) {
+
+    console.warn(
+      "Sentinel session expired. Returning to login."
+    )
+
+    localStorage.removeItem(
+      "sentinel_token"
+    )
+
+    localStorage.removeItem(
+      "sentinel_user"
+    )
+
+    setAuthenticated(false)
+    setCurrentUser(null)
+
+    return
+  }
+
+  reconnectAttempts += 1
+
+  const delay =
+    Math.min(
+      1000 *
+        2 **
+          (reconnectAttempts - 1),
+      30000
+    )
+
+  console.log(
+    `Reconnecting to Sentinel WebSocket in ${
+      delay / 1000
+    }s...`
+  )
+
+  reconnectTimer =
+    setTimeout(
+      connectWebSocket,
+      delay
+    )
+}
+
+  }
+
+
+  /* ============================================================
+     START CONNECTION
+  ============================================================ */
+
+  connectWebSocket()
+
+
+  /* ============================================================
+     CLEANUP
+  ============================================================ */
+
+  return () => {
+
+    isClosing = true
+
+
+    setWebsocketConnected(
+      false
+    )
+
+
+    if (reconnectTimer) {
+
+      clearTimeout(
+        reconnectTimer
+      )
 
     }
 
 
-    return () => {
+    if (websocket) {
+
+      websocket.onclose = null
+
+      websocket.onerror = null
 
       websocket.close()
 
     }
 
-  }, [authenticated])
-
-
-  /* ============================================================
-     FILTER ALERTS
-  ============================================================ */
-
-  const filteredAlerts =
-    alerts.filter(
-      (alert) => {
-
-        const searchText =
-          search.toLowerCase()
-
-
-        const matchesSearch =
-          alert.alert_type
-            ?.toLowerCase()
-            .includes(searchText) ||
-
-          alert.source_ip
-            ?.toLowerCase()
-            .includes(searchText) ||
-
-          alert.username
-            ?.toLowerCase()
-            .includes(searchText)
-
-
-        const matchesSeverity =
-          severityFilter === "ALL" ||
-          alert.severity === severityFilter
-
-
-        return (
-          matchesSearch &&
-          matchesSeverity
-        )
-
-      }
-    )
-
-
-  /* ============================================================
-     FORMAT TIMESTAMP
-  ============================================================ */
-
-  const formatTimestamp = (
-    timestamp
-  ) => {
-
-    if (!timestamp) {
-      return "Unknown"
-    }
-
-
-    const date =
-      new Date(timestamp)
-
-
-    if (isNaN(date.getTime())) {
-      return timestamp
-    }
-
-
-    return date.toLocaleString()
-
   }
 
 
-  /* ============================================================
-     ANALYTICS
-  ============================================================ */
+}, [authenticated])
 
-  const highCount =
-    alerts.filter(
-      (alert) =>
-        alert.severity === "HIGH"
-    ).length
 
+/* ============================================================
+   FILTER ALERTS
+============================================================ */
 
-  const mediumCount =
-    alerts.filter(
-      (alert) =>
-        alert.severity === "MEDIUM"
-    ).length
+const filteredAlerts =
+  alerts.filter(
+    (alert) => {
 
+      const searchText =
+        search.toLowerCase()
 
-  const maxSeverity =
-    Math.max(
-      highCount,
-      mediumCount,
-      1
-    )
 
+      const matchesSearch =
+        alert.alert_type
+          ?.toLowerCase()
+          .includes(searchText) ||
 
-  const alertTypeCounts =
-    alerts.reduce(
-      (counts, alert) => {
+        alert.source_ip
+          ?.toLowerCase()
+          .includes(searchText) ||
 
-        const type =
-          alert.alert_type ||
-          "Unknown"
+        alert.username
+          ?.toLowerCase()
+          .includes(searchText)
 
 
-        counts[type] =
-          (counts[type] || 0) + 1
+      const matchesSeverity =
+        severityFilter === "ALL" ||
+        alert.severity === severityFilter
 
 
-        return counts
+      const matchesStatus =
+        statusFilter === "ALL" ||
+        alert.status === statusFilter
 
-      },
-      {}
-    )
 
-
-  const sortedAlertTypes =
-    Object.entries(
-      alertTypeCounts
-    ).sort(
-      (a, b) =>
-        b[1] - a[1]
-    )
-
-
-  /* ============================================================
-     EVENT HELPERS
-  ============================================================ */
-
-  const getEventLabel = (
-    event
-  ) => {
-
-    if (
-      event.event_type ===
-      "authentication_failure"
-    ) {
-      return "Authentication Failure"
-    }
-
-
-    if (
-      event.event_type ===
-      "authentication_success"
-    ) {
-      return "Authentication Success"
-    }
-
-
-    if (
-      event.event_type ===
-      "network_connection"
-    ) {
-      return "Network Connection"
-    }
-
-
-    return (
-      event.event_type ||
-      "Unknown Event"
-    )
-
-  }
-
-
-  const getEventStatusStyle = (
-    event
-  ) => {
-
-    if (
-      event.event_type ===
-      "authentication_failure"
-    ) {
-      return "bg-red-500/10 text-red-400"
-    }
-
-
-    if (
-      event.event_type ===
-      "authentication_success"
-    ) {
-      return "bg-green-500/10 text-green-400"
-    }
-
-
-    if (
-      event.event_type ===
-      "network_connection"
-    ) {
-      return "bg-cyan-500/10 text-cyan-400"
-    }
-
-
-    return "bg-slate-500/10 text-slate-400"
-
-  }
-
-
-  const getAlertStatusStyle = (
-    status
-  ) => {
-
-    if (status === "DETECTED") {
-      return "bg-red-500/10 text-red-400"
-    }
-
-
-    if (status === "INVESTIGATING") {
-      return "bg-blue-500/10 text-blue-400"
-    }
-
-
-    if (status === "RESOLVED") {
-      return "bg-green-500/10 text-green-400"
-    }
-
-
-    return "bg-slate-500/10 text-slate-400"
-
-  }
-
-
-  /* ============================================================
-     UPDATE ALERT STATUS
-  ============================================================ */
-
-  const updateAlertStatus = async (
-    alertId,
-    newStatus
-  ) => {
-
-    if (!alertId) {
-      return
-    }
-
-
-    try {
-
-      const response =
-        await authenticatedFetch(
-          `${API}/api/alerts/${alertId}`,
-          {
-            method: "PATCH",
-
-            headers: {
-              "Content-Type":
-                "application/json"
-            },
-
-            body: JSON.stringify({
-              status: newStatus
-            })
-
-          }
-        )
-
-
-      if (!response.ok) {
-
-        throw new Error(
-          "Failed to update alert"
-        )
-
-      }
-
-
-      const data =
-        await response.json()
-
-
-      const updatedAlert =
-        data.alert
-
-
-      setAlerts(
-        (currentAlerts) =>
-          currentAlerts.map(
-            (alert) =>
-              alert._id === alertId
-                ? {
-                    ...alert,
-                    ...updatedAlert,
-                    _id: alertId
-                  }
-                : alert
-          )
+      return (
+        matchesSearch &&
+        matchesSeverity &&
+        matchesStatus
       )
 
-
-      setSelectedAlert(
-        (currentAlert) => {
-
-          if (!currentAlert) {
-            return null
-          }
+    }
+  )
 
 
-          if (
-            currentAlert._id !==
-            alertId
-          ) {
-            return currentAlert
-          }
+/* ============================================================
+   FORMAT TIMESTAMP
+============================================================ */
+
+const formatTimestamp = (
+  timestamp
+) => {
+
+  if (!timestamp) {
+    return "Unknown"
+  }
+
+  let normalizedTimestamp = timestamp
+
+  if (
+    typeof timestamp === "object" &&
+    timestamp !== null
+  ) {
+    if (timestamp.$date) {
+      normalizedTimestamp =
+        timestamp.$date
+    } else {
+      return "Unknown"
+    }
+  }
+
+  const date =
+    new Date(normalizedTimestamp)
+
+  if (isNaN(date.getTime())) {
+    return "Unknown"
+  }
+
+  return date.toLocaleString()
+}
 
 
-          return {
-            ...currentAlert,
-            ...updatedAlert,
-            _id: alertId
-          }
+/* ============================================================
+   ANALYTICS
+============================================================ */
+
+const highCount =
+  alerts.filter(
+    (alert) =>
+      alert.severity === "HIGH"
+  ).length
+
+
+const mediumCount =
+  alerts.filter(
+    (alert) =>
+      alert.severity === "MEDIUM"
+  ).length
+
+
+const maxSeverity =
+  Math.max(
+    highCount,
+    mediumCount,
+    1
+  )
+
+
+const alertTypeCounts =
+  alerts.reduce(
+    (counts, alert) => {
+
+      const type =
+        alert.alert_type ||
+        "Unknown"
+
+
+      counts[type] =
+        (counts[type] || 0) + 1
+
+
+      return counts
+
+    },
+    {}
+  )
+
+
+const sortedAlertTypes =
+  Object.entries(
+    alertTypeCounts
+  ).sort(
+    (a, b) =>
+      b[1] - a[1]
+  )
+
+
+/* ============================================================
+   EVENT HELPERS
+============================================================ */
+
+const getEventLabel = (
+  event
+) => {
+
+  if (
+    event.event_type ===
+    "authentication_failure"
+  ) {
+
+    return "Authentication Failure"
+
+  }
+
+
+  if (
+    event.event_type ===
+    "authentication_success"
+  ) {
+
+    return "Authentication Success"
+
+  }
+
+
+  if (
+    event.event_type ===
+    "network_connection"
+  ) {
+
+    return "Network Connection"
+
+  }
+
+
+  return (
+    event.event_type ||
+    "Unknown Event"
+  )
+
+}
+
+
+const getEventStatusStyle = (
+  event
+) => {
+
+  if (
+    event.event_type ===
+    "authentication_failure"
+  ) {
+
+    return "bg-red-500/10 text-red-400"
+
+  }
+
+
+  if (
+    event.event_type ===
+    "authentication_success"
+  ) {
+
+    return "bg-green-500/10 text-green-400"
+
+  }
+
+
+  if (
+    event.event_type ===
+    "network_connection"
+  ) {
+
+    return "bg-cyan-500/10 text-cyan-400"
+
+  }
+
+
+  return "bg-slate-500/10 text-slate-400"
+
+}
+
+
+const getAlertStatusStyle = (
+  status
+) => {
+
+  if (status === "DETECTED") {
+
+    return "bg-red-500/10 text-red-400"
+
+  }
+
+
+  if (status === "INVESTIGATING") {
+
+    return "bg-blue-500/10 text-blue-400"
+
+  }
+
+
+  if (status === "RESOLVED") {
+
+    return "bg-green-500/10 text-green-400"
+
+  }
+
+
+  return "bg-slate-500/10 text-slate-400"
+
+}
+/* ============================================================
+   UPDATE ALERT STATUS
+============================================================ */
+
+/* ============================================================
+   UPDATE ALERT STATUS
+============================================================ */
+
+const updateAlertStatus = async (
+  alertId,
+  newStatus
+) => {
+  if (!alertId) {
+    return
+  }
+
+  try {
+    const response =
+      await authenticatedFetch(
+        `${API}/api/alerts/${alertId}`,
+        {
+          method: "PATCH",
+          headers: {
+            "Content-Type":
+              "application/json"
+          },
+          body: JSON.stringify({
+            status: newStatus
+          })
+        }
+      )
+
+    if (!response.ok) {
+      throw new Error(
+        "Failed to update alert"
+      )
+    }
+
+    const data =
+      await response.json()
+
+    const updatedAlert =
+      data.alert
+
+    setAlerts(
+      (currentAlerts) =>
+        currentAlerts.map(
+          (alert) =>
+            alert._id === alertId
+              ? {
+                  ...alert,
+                  ...updatedAlert,
+                  _id: alertId
+                }
+              : alert
+        )
+    )
+
+    setSelectedAlert(
+      (currentAlert) => {
+        if (!currentAlert) {
+          return null
+        }
+
+        if (
+          currentAlert._id !==
+          alertId
+        ) {
+          return currentAlert
+        }
+
+        return {
+          ...currentAlert,
+          ...updatedAlert,
+          _id: alertId
+        }
+      }
+    )
+
+    /*
+     * Refresh the investigation timeline
+     * after the status has been changed.
+     */
+    await fetchAlertActivity(
+      alertId
+    )
+
+    await fetchDashboardData()
+
+  } catch (error) {
+
+    console.error(
+      "Failed to update alert status:",
+      error
+    )
+
+  }
+}
+/* ============================================================
+   FETCH ALERT ACTIVITY
+============================================================ */
+
+const fetchAlertActivity = async (
+  alertId
+) => {
+  if (!alertId) {
+    return
+  }
+
+  setActivityLoading(true)
+  setAlertActivity([])
+
+  try {
+    const response =
+      await authenticatedFetch(
+        `${API}/api/alerts/${alertId}/activity`
+      )
+
+    if (!response.ok) {
+      throw new Error(
+        "Failed to fetch alert activity"
+      )
+    }
+
+    const data =
+      await response.json()
+
+    setAlertActivity(
+      data.activity || []
+    )
+
+  } catch (error) {
+
+    console.error(
+      "Failed to fetch alert activity:",
+      error
+    )
+
+    setAlertActivity([])
+
+  } finally {
+
+    setActivityLoading(false)
+
+  }
+}
+/* ============================================================
+   ADD ANALYST NOTE
+============================================================ */
+
+const addAnalystNote = async () => {
+  if (!selectedAlert?._id) {
+    return
+  }
+
+  const note = analystNote.trim()
+
+  if (!note) {
+    setNoteMessage("Enter a note first.")
+    return
+  }
+
+  if (note.length > 1000) {
+    setNoteMessage(
+      "Note cannot exceed 1000 characters."
+    )
+    return
+  }
+
+  setNoteSubmitting(true)
+  setNoteMessage("")
+
+  try {
+    const response =
+      await authenticatedFetch(
+        `${API}/api/alerts/${selectedAlert._id}/notes`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type":
+              "application/json"
+          },
+          body: JSON.stringify({
+            note
+          })
+        }
+      )
+
+    const data =
+      await response.json()
+
+    if (!response.ok) {
+      throw new Error(
+        data.detail ||
+        "Failed to add note"
+      )
+    }
+
+    setAnalystNote("")
+    setNoteMessage(
+      "Investigation note added."
+    )
+
+    await fetchAlertActivity(
+      selectedAlert._id
+    )
+
+  } catch (error) {
+
+    console.error(
+      "Failed to add analyst note:",
+      error
+    )
+
+    setNoteMessage(
+      error.message ||
+      "Failed to add investigation note."
+    )
+
+  } finally {
+
+    setNoteSubmitting(false)
+
+  }
+}
+{/* ============================================================
+   LOG ANALYZER
+============================================================ */}
+
+const analyzeLogFile = async () => {
+
+  if (!selectedFile) {
+
+    setUploadMessage(
+      "Please select a log file first."
+    )
+
+    return
+
+  }
+
+
+  setUploading(true)
+
+  setUploadMessage(
+    "Analyzing log file..."
+  )
+
+
+  try {
+
+    const fileContent =
+      await selectedFile.text()
+
+
+    const logs =
+      fileContent
+        .split("\n")
+        .map(
+          (line) =>
+            line.trim()
+        )
+        .filter(
+          (line) =>
+            line.length > 0
+        )
+
+
+    const response =
+      await authenticatedFetch(
+        `${API}/api/analyze`,
+        {
+          method: "POST",
+
+          headers: {
+            "Content-Type":
+              "application/json"
+          },
+
+          body: JSON.stringify({
+            logs
+          })
 
         }
       )
 
 
-      fetchDashboardData()
+    if (!response.ok) {
 
-    } catch (error) {
-
-      console.error(
-        "Failed to update alert status:",
-        error
+      throw new Error(
+        "Analysis failed"
       )
 
     }
 
-  }
+
+    const data =
+      await response.json()
 
 
-  /* ============================================================
-     LOG ANALYZER
-  ============================================================ */
+    setThreatSummary(
+      data.threat_summary ||
+      null
+    )
 
-  const analyzeLogFile = async () => {
-
-    if (!selectedFile) {
-
-      setUploadMessage(
-        "Please select a log file first."
-      )
-
-      return
-
-    }
-
-
-    setUploading(true)
 
     setUploadMessage(
-      "Analyzing log file..."
+      `Analysis complete: ${data.events_processed} events processed, ${data.alerts_detected} alerts detected.`
     )
 
 
-    try {
-
-      const fileContent =
-        await selectedFile.text()
+    setSelectedFile(null)
 
 
-      const logs =
-        fileContent
-          .split("\n")
-          .map(
-            (line) =>
-              line.trim()
-          )
-          .filter(
-            (line) =>
-              line.length > 0
-          )
+    setTimeout(
+      () => {
 
+        fetchDashboardData()
 
-      const response =
-        await authenticatedFetch(
-          `${API}/api/analyze`,
-          {
-            method: "POST",
-
-            headers: {
-              "Content-Type":
-                "application/json"
-            },
-
-            body: JSON.stringify({
-              logs
-            })
-
-          }
-        )
-
-
-      if (!response.ok) {
-
-        throw new Error(
-          "Analysis failed"
-        )
-
-      }
-
-
-      const data =
-        await response.json()
-
-
-      setThreatSummary(
-        data.threat_summary ||
-        null
-      )
-
-
-      setUploadMessage(
-        `Analysis complete: ${data.events_processed} events processed, ${data.alerts_detected} alerts detected.`
-      )
-
-
-      setSelectedFile(null)
-
-
-      setTimeout(
-        () => {
-          fetchDashboardData()
-        },
-        500
-      )
-
-    } catch (error) {
-
-      console.error(
-        "Log analysis failed:",
-        error
-      )
-
-
-      setUploadMessage(
-        "Failed to analyze log file."
-      )
-
-    } finally {
-
-      setUploading(false)
-
-    }
-
-  }
-
-
-  /* ============================================================
-     LOGIN SCREEN
-  ============================================================ */
-
-  if (!authenticated) {
-
-    return (
-      <Login
-        onLogin={handleLogin}
-      />
+      },
+      500
     )
 
+
+  } catch (error) {
+
+    console.error(
+      "Log analysis failed:",
+      error
+    )
+
+
+    setUploadMessage(
+      "Failed to analyze log file."
+    )
+
+
+  } finally {
+
+    setUploading(false)
+
   }
 
+}
 
-  /* ============================================================
-     DASHBOARD
-  ============================================================ */
+
+/* ============================================================
+   LOGIN SCREEN
+============================================================ */
+
+if (!authenticated) {
 
   return (
 
-    <div className="min-h-screen bg-slate-950 text-white">
+    <Login
+      onLogin={handleLogin}
+    />
+
+  )
+
+}
 
 
-      {/* ======================================================
-          HEADER
-      ====================================================== */}
+/* ============================================================
+   DASHBOARD
+============================================================ */
 
-      <header className="border-b border-slate-800 px-8 py-5">
+return (
 
-        <div className="flex flex-col gap-5 md:flex-row md:items-center md:justify-between">
+  <div className="min-h-screen bg-slate-950 text-white">
 
-          <div>
 
-            <h1 className="text-2xl font-bold">
-              SENTINEL
-            </h1>
+    {/* ======================================================
+        HEADER
+    ====================================================== */}
 
-            <p className="text-sm text-slate-400">
-              Security Operations & Threat Detection Platform
-            </p>
+    <header className="border-b border-slate-800 px-8 py-5">
+
+      <div className="flex flex-col gap-5 md:flex-row md:items-center md:justify-between">
+
+
+        <div>
+
+          <h1 className="text-2xl font-bold">
+            SENTINEL
+          </h1>
+
+          <p className="text-sm text-slate-400">
+            Security Operations & Threat Detection Platform
+          </p>
+
+        </div>
+
+
+        <div className="flex items-center gap-5">
+
+
+          {/* ==================================================
+              WEBSOCKET STATUS
+          ================================================== */}
+
+          <div className="flex items-center gap-2 text-sm">
+
+            <span
+              className={`h-2 w-2 rounded-full ${
+                websocketConnected
+                  ? "bg-green-400"
+                  : "bg-yellow-400"
+              }`}
+            />
+
+
+            <span
+              className={
+                websocketConnected
+                  ? "text-green-400"
+                  : "text-yellow-400"
+              }
+            >
+
+              {websocketConnected
+                ? "LIVE MONITORING"
+                : "RECONNECTING..."
+              }
+
+            </span>
 
           </div>
 
 
-          <div className="flex items-center gap-5">
+          {/* ==================================================
+              USER
+          ================================================== */}
 
-            <div className="flex items-center gap-2 text-sm">
+          <div className="flex items-center gap-3">
 
-              <span
-                className={`h-2 w-2 rounded-full ${
-                  websocketConnected
-                    ? "bg-green-400"
-                    : "bg-yellow-400"
-                }`}
-              />
+            <div className="text-right">
 
-              <span
-                className={
-                  websocketConnected
-                    ? "text-green-400"
-                    : "text-yellow-400"
-                }
-              >
+              <p className="text-sm font-medium text-white">
+                {currentUser?.username || "Analyst"}
+              </p>
 
-                {websocketConnected
-                  ? "LIVE MONITORING"
-                  : "CONNECTING..."
-                }
-
-              </span>
+              <p className="text-xs text-slate-500">
+                {currentUser?.role || "analyst"}
+              </p>
 
             </div>
 
 
-            <div className="flex items-center gap-3">
-
-              <div className="text-right">
-
-                <p className="text-sm font-medium text-white">
-                  {currentUser?.username || "Analyst"}
-                </p>
-
-                <p className="text-xs text-slate-500">
-                  {currentUser?.role || "analyst"}
-                </p>
-
-              </div>
-
-
-              <button
-                onClick={handleLogout}
-                className="rounded-lg border border-slate-700 bg-slate-900 px-4 py-2 text-xs font-medium text-slate-300 transition hover:border-red-900 hover:bg-red-500/10 hover:text-red-400"
-              >
-                LOGOUT
-              </button>
-
-            </div>
+            <button
+              onClick={handleLogout}
+              className="rounded-lg border border-slate-700 bg-slate-900 px-4 py-2 text-xs font-medium text-slate-300 transition hover:border-red-900 hover:bg-red-500/10 hover:text-red-400"
+            >
+              LOGOUT
+            </button>
 
           </div>
 
         </div>
 
-      </header>
+      </div>
+
+    </header>
 
 
-      <main className="p-8">
+    <main className="p-8">
 
 
-        {/* ====================================================
-            SECURITY OVERVIEW
-        ==================================================== */}
+      {/* ====================================================
+          SECURITY OVERVIEW
+      ==================================================== */}
 
-        <h2 className="mb-6 text-xl font-semibold">
-          Security Overview
+      <h2 className="mb-6 text-xl font-semibold">
+        Security Overview
+      </h2>
+
+
+      <div className="grid grid-cols-1 gap-5 md:grid-cols-4">
+
+
+        {/* TOTAL ALERTS */}
+
+        <div className="rounded-xl border border-slate-800 bg-slate-900 p-6">
+
+          <p className="text-sm text-slate-400">
+            Total Alerts
+          </p>
+
+          <p className="mt-2 text-3xl font-bold">
+            {stats.total_alerts}
+          </p>
+
+        </div>
+
+
+        {/* ACTIVE ALERTS */}
+
+        <div className="rounded-xl border border-red-900 bg-slate-900 p-6">
+
+          <p className="text-sm text-slate-400">
+            Active Alerts
+          </p>
+
+          <p className="mt-2 text-3xl font-bold text-red-400">
+            {stats.active_alerts}
+          </p>
+
+        </div>
+
+
+        {/* INVESTIGATING */}
+
+        <div className="rounded-xl border border-blue-900 bg-slate-900 p-6">
+
+          <p className="text-sm text-slate-400">
+            Investigating
+          </p>
+
+          <p className="mt-2 text-3xl font-bold text-blue-400">
+            {stats.investigating}
+          </p>
+
+        </div>
+
+
+        {/* RESOLVED */}
+
+        <div className="rounded-xl border border-green-900 bg-slate-900 p-6">
+
+          <p className="text-sm text-slate-400">
+            Resolved
+          </p>
+
+          <p className="mt-2 text-3xl font-bold text-green-400">
+            {stats.resolved}
+          </p>
+
+        </div>
+
+      </div>
+
+
+      {/* ====================================================
+          SECURITY ANALYTICS
+      ==================================================== */}
+
+      <section className="mt-8">
+
+        <h2 className="mb-5 text-xl font-semibold">
+          Security Analytics
         </h2>
 
 
-        <div className="grid grid-cols-1 gap-5 md:grid-cols-4">
+        <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
 
+
+          {/* ==================================================
+              ALERT SEVERITY
+          ================================================== */}
 
           <div className="rounded-xl border border-slate-800 bg-slate-900 p-6">
 
-            <p className="text-sm text-slate-400">
-              Total Alerts
+            <h3 className="text-lg font-semibold">
+              Alert Severity
+            </h3>
+
+            <p className="mt-1 text-sm text-slate-400">
+              Distribution of detected alert severity
             </p>
 
-            <p className="mt-2 text-3xl font-bold">
-              {stats.total_alerts}
-            </p>
 
-          </div>
+            <div className="mt-8 space-y-6">
 
 
-          <div className="rounded-xl border border-red-900 bg-slate-900 p-6">
+              {/* HIGH */}
 
-            <p className="text-sm text-slate-400">
-              Active Alerts
-            </p>
+              <div>
 
-            <p className="mt-2 text-3xl font-bold text-red-400">
-              {stats.active_alerts}
-            </p>
+                <div className="mb-2 flex justify-between text-sm">
 
-          </div>
+                  <span className="text-slate-300">
+                    HIGH
+                  </span>
 
-
-          <div className="rounded-xl border border-blue-900 bg-slate-900 p-6">
-
-            <p className="text-sm text-slate-400">
-              Investigating
-            </p>
-
-            <p className="mt-2 text-3xl font-bold text-blue-400">
-              {stats.investigating}
-            </p>
-
-          </div>
-
-
-          <div className="rounded-xl border border-green-900 bg-slate-900 p-6">
-
-            <p className="text-sm text-slate-400">
-              Resolved
-            </p>
-
-            <p className="mt-2 text-3xl font-bold text-green-400">
-              {stats.resolved}
-            </p>
-
-          </div>
-
-        </div>
-
-
-        {/* ====================================================
-            SECURITY ANALYTICS
-        ==================================================== */}
-
-        <section className="mt-8">
-
-          <h2 className="mb-5 text-xl font-semibold">
-            Security Analytics
-          </h2>
-
-
-          <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
-
-
-            {/* ALERT SEVERITY */}
-
-            <div className="rounded-xl border border-slate-800 bg-slate-900 p-6">
-
-              <h3 className="text-lg font-semibold">
-                Alert Severity
-              </h3>
-
-              <p className="mt-1 text-sm text-slate-400">
-                Distribution of detected alert severity
-              </p>
-
-
-              <div className="mt-8 space-y-6">
-
-                <div>
-
-                  <div className="mb-2 flex justify-between text-sm">
-
-                    <span className="text-slate-300">
-                      HIGH
-                    </span>
-
-                    <span className="text-red-400">
-                      {highCount}
-                    </span>
-
-                  </div>
-
-
-                  <div className="h-3 overflow-hidden rounded-full bg-slate-800">
-
-                    <div
-                      className="h-full rounded-full bg-red-500 transition-all duration-500"
-                      style={{
-                        width:
-                          `${(highCount / maxSeverity) * 100}%`
-                      }}
-                    />
-
-                  </div>
+                  <span className="text-red-400">
+                    {highCount}
+                  </span>
 
                 </div>
 
 
-                <div>
+                <div className="h-3 overflow-hidden rounded-full bg-slate-800">
 
-                  <div className="mb-2 flex justify-between text-sm">
+                  <div
+                    className="h-full rounded-full bg-red-500 transition-all duration-500"
+                    style={{
+                      width:
+                        `${(highCount / maxSeverity) * 100}%`
+                    }}
+                  />
 
-                    <span className="text-slate-300">
-                      MEDIUM
-                    </span>
+                </div>
 
-                    <span className="text-yellow-400">
-                      {mediumCount}
-                    </span>
-
-                  </div>
+              </div>
 
 
-                  <div className="h-3 overflow-hidden rounded-full bg-slate-800">
+              {/* MEDIUM */}
 
-                    <div
-                      className="h-full rounded-full bg-yellow-500 transition-all duration-500"
-                      style={{
-                        width:
-                          `${(mediumCount / maxSeverity) * 100}%`
-                      }}
-                    />
+              <div>
 
-                  </div>
+                <div className="mb-2 flex justify-between text-sm">
+
+                  <span className="text-slate-300">
+                    MEDIUM
+                  </span>
+
+                  <span className="text-yellow-400">
+                    {mediumCount}
+                  </span>
+
+                </div>
+
+
+                <div className="h-3 overflow-hidden rounded-full bg-slate-800">
+
+                  <div
+                    className="h-full rounded-full bg-yellow-500 transition-all duration-500"
+                    style={{
+                      width:
+                        `${(mediumCount / maxSeverity) * 100}%`
+                    }}
+                  />
 
                 </div>
 
@@ -1373,1019 +1786,941 @@ function App() {
 
             </div>
 
-
-            {/* ALERT TYPES */}
-
-            <div className="rounded-xl border border-slate-800 bg-slate-900 p-6">
-
-              <h3 className="text-lg font-semibold">
-                Alert Types
-              </h3>
-
-              <p className="mt-1 text-sm text-slate-400">
-                Detected threat categories
-              </p>
+          </div>
 
 
-              {sortedAlertTypes.length === 0 ? (
+          {/* ==================================================
+              ALERT TYPES
+          ================================================== */}
 
-                <div className="mt-8 text-sm text-slate-500">
-                  No alert data available.
-                </div>
+          <div className="rounded-xl border border-slate-800 bg-slate-900 p-6">
 
-              ) : (
+            <h3 className="text-lg font-semibold">
+              Alert Types
+            </h3>
 
-                <div className="mt-6 space-y-4">
-
-                  {sortedAlertTypes.map(
-                    ([type, count]) => {
-
-                      const maximum =
-                        sortedAlertTypes[0][1]
+            <p className="mt-1 text-sm text-slate-400">
+              Detected threat categories
+            </p>
 
 
-                      return (
+            {sortedAlertTypes.length === 0 ? (
 
-                        <div key={type}>
+              <div className="mt-8 text-sm text-slate-500">
+                No alert data available.
+              </div>
 
-                          <div className="mb-2 flex items-center justify-between">
+            ) : (
 
-                            <span className="text-sm text-slate-300">
-                              {type}
-                            </span>
+              <div className="mt-6 space-y-4">
 
-                            <span className="text-sm font-medium text-cyan-400">
-                              {count}
-                            </span>
+                {sortedAlertTypes.map(
+                  ([type, count]) => {
 
-                          </div>
+                    const maximum =
+                      sortedAlertTypes[0][1]
 
 
-                          <div className="h-2 overflow-hidden rounded-full bg-slate-800">
+                    return (
 
-                            <div
-                              className="h-full rounded-full bg-cyan-500 transition-all duration-500"
-                              style={{
-                                width:
-                                  `${(count / maximum) * 100}%`
-                              }}
-                            />
+                      <div key={type}>
 
-                          </div>
+                        <div className="mb-2 flex items-center justify-between">
+
+                          <span className="text-sm text-slate-300">
+                            {type}
+                          </span>
+
+                          <span className="text-sm font-medium text-cyan-400">
+                            {count}
+                          </span>
 
                         </div>
 
-                      )
 
-                    }
-                  )}
+                        <div className="h-2 overflow-hidden rounded-full bg-slate-800">
 
-                </div>
+                          <div
+                            className="h-full rounded-full bg-cyan-500 transition-all duration-500"
+                            style={{
+                              width:
+                                `${(count / maximum) * 100}%`
+                            }}
+                          />
 
+                        </div>
+
+                      </div>
+
+                    )
+
+                  }
+                )}
+
+              </div>
+
+            )}
+
+          </div>
+
+        </div>
+
+     </section>
+
+{/* ============================================================
+   THREAT SUMMARY
+============================================================ */}
+
+<section className="mt-8">
+  <div className="rounded-xl border border-slate-800 bg-slate-900 p-6">
+
+    <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+
+      <div>
+
+        <h2 className="text-xl font-semibold">
+          Threat Intelligence Summary
+        </h2>
+
+        <p className="mt-1 text-sm text-slate-400">
+          Automated analysis of detected security activity
+        </p>
+
+      </div>
+
+
+      {threatSummary && (
+
+        <div
+          className={`rounded-lg border px-4 py-2 text-sm font-semibold ${
+            threatSummary.threat_level === "HIGH"
+              ? "border-red-500/30 bg-red-500/10 text-red-400"
+              : threatSummary.threat_level === "MEDIUM"
+                ? "border-yellow-500/30 bg-yellow-500/10 text-yellow-400"
+                : "border-green-500/30 bg-green-500/10 text-green-400"
+          }`}
+        >
+
+          THREAT LEVEL:{" "}
+          {threatSummary.threat_level}
+
+        </div>
+
+      )}
+
+    </div>
+
+
+    {!threatSummary ? (
+
+      <div className="mt-6 rounded-lg border border-slate-800 bg-slate-950 p-5 text-sm text-slate-500">
+
+        No threat summary available yet.
+
+      </div>
+
+    ) : (
+
+      <div className="mt-6 space-y-6">
+
+
+        {/* SUMMARY */}
+
+        <div>
+
+          <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-500">
+            Summary
+          </p>
+
+          <p className="text-sm leading-6 text-slate-300">
+            {threatSummary.summary}
+          </p>
+
+        </div>
+
+
+        {/* DETECTED THREATS */}
+
+        {threatSummary.detected_threats?.length > 0 && (
+
+          <div>
+
+            <p className="mb-3 text-xs font-semibold uppercase tracking-wider text-slate-500">
+              Detected Threats
+            </p>
+
+
+            <div className="space-y-2">
+
+              {threatSummary.detected_threats.map(
+                (threat, index) => (
+
+                  <div
+                    key={index}
+                    className="rounded-lg border border-red-500/10 bg-red-500/5 px-4 py-3 text-sm text-slate-300"
+                  >
+
+                    <span className="mr-2 text-red-400">
+                      ●
+                    </span>
+
+                    {threat}
+
+                  </div>
+
+                )
               )}
 
             </div>
 
           </div>
 
-        </section>
-
-
-        {/* ====================================================
-            LOG ANALYZER
-        ==================================================== */}
-
-        <section className="mt-8">
-
-          <div className="rounded-xl border border-slate-800 bg-slate-900 p-6">
-
-            <div className="mb-6">
-
-              <h2 className="text-lg font-semibold">
-                Log Analyzer
-              </h2>
-
-              <p className="mt-1 text-sm text-slate-400">
-                Upload security logs and run them through the Sentinel detection engine.
-              </p>
-
-            </div>
-
-
-            <div className="flex flex-col gap-4 md:flex-row md:items-center">
-
-              <label className="flex-1 cursor-pointer rounded-lg border border-dashed border-slate-700 bg-slate-950 px-4 py-4 transition hover:border-slate-500">
-
-                <input
-                  type="file"
-                  accept=".log,.txt"
-                  className="hidden"
-                  onChange={(event) => {
-
-                    setSelectedFile(
-                      event.target.files[0] ||
-                      null
-                    )
-
-                    setUploadMessage("")
-
-                  }}
-                />
-
-
-                <div className="text-sm">
-
-                  {selectedFile ? (
-
-                    <span className="text-white">
-                      {selectedFile.name}
-                    </span>
-
-                  ) : (
-
-                    <span className="text-slate-500">
-                      Click to choose a .log or .txt file
-                    </span>
-
-                  )}
-
-                </div>
-
-              </label>
-
-
-              <button
-                onClick={analyzeLogFile}
-                disabled={uploading}
-                className="rounded-lg bg-cyan-500 px-6 py-4 text-sm font-semibold text-slate-950 transition hover:bg-cyan-400 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-
-                {uploading
-                  ? "ANALYZING..."
-                  : "ANALYZE LOG"
-                }
-
-              </button>
-
-            </div>
-
-
-            {uploadMessage && (
-
-              <div className="mt-4 rounded-lg border border-slate-800 bg-slate-950 px-4 py-3 text-sm text-slate-400">
-                {uploadMessage}
-              </div>
-
-            )}
-
-          </div>
-
-        </section>
-
-
-        {/* ====================================================
-            THREAT ANALYSIS
-        ==================================================== */}
-
-        {threatSummary && (
-
-          <section className="mt-8">
-
-            <div className="rounded-xl border border-slate-800 bg-slate-900 p-6">
-
-              <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-
-                <div>
-
-                  <h2 className="text-lg font-semibold">
-                    Threat Analysis
-                  </h2>
-
-                  <p className="mt-1 text-sm text-slate-400">
-                    Automated security analysis generated by Sentinel
-                  </p>
-
-                </div>
-
-
-                <span
-                  className={`rounded-lg px-4 py-2 text-sm font-semibold ${
-                    threatSummary.threat_level === "HIGH"
-                      ? "bg-red-500/10 text-red-400"
-                      : threatSummary.threat_level === "MEDIUM"
-                      ? "bg-yellow-500/10 text-yellow-400"
-                      : "bg-green-500/10 text-green-400"
-                  }`}
-                >
-
-                  THREAT LEVEL:{" "}
-                  {threatSummary.threat_level}
-
-                </span>
-
-              </div>
-
-
-              <div className="mt-6 rounded-lg border border-slate-800 bg-slate-950 p-5">
-
-                <p className="text-sm font-medium text-slate-300">
-                  Analyst Summary
-                </p>
-
-                <p className="mt-2 text-sm leading-6 text-slate-400">
-                  {threatSummary.summary}
-                </p>
-
-
-                {threatSummary.generated_at && (
-
-                  <p className="mt-3 text-xs text-slate-600">
-
-                    Generated:{" "}
-
-                    {formatTimestamp(
-                      threatSummary.generated_at
-                    )}
-
-                  </p>
-
-                )}
-
-              </div>
-
-
-              <div className="mt-6 grid grid-cols-1 gap-5 lg:grid-cols-2">
-
-
-                {/* DETECTED THREATS */}
-
-                <div className="rounded-lg border border-slate-800 bg-slate-950 p-5">
-
-                  <h3 className="font-medium">
-                    Detected Threats
-                  </h3>
-
-
-                  <div className="mt-4 space-y-3">
-
-                    {threatSummary.detected_threats?.length > 0 ? (
-
-                      threatSummary.detected_threats.map(
-                        (threat, index) => (
-
-                          <div
-                            key={index}
-                            className="flex gap-3 rounded-lg border border-red-900/50 bg-red-500/5 p-3"
-                          >
-
-                            <span className="mt-1 h-2 w-2 shrink-0 rounded-full bg-red-400"></span>
-
-                            <p className="text-sm text-slate-300">
-                              {threat}
-                            </p>
-
-                          </div>
-
-                        )
-                      )
-
-                    ) : (
-
-                      <p className="text-sm text-slate-500">
-                        No specific threats detected.
-                      </p>
-
-                    )}
-
-                  </div>
-
-                </div>
-
-
-                {/* RECOMMENDED ACTIONS */}
-
-                <div className="rounded-lg border border-slate-800 bg-slate-950 p-5">
-
-                  <h3 className="font-medium">
-                    Recommended Actions
-                  </h3>
-
-
-                  <div className="mt-4 space-y-3">
-
-                    {threatSummary.recommended_actions?.length > 0 ? (
-
-                      threatSummary.recommended_actions.map(
-                        (action, index) => (
-
-                          <div
-                            key={index}
-                            className="flex gap-3 rounded-lg border border-cyan-900/50 bg-cyan-500/5 p-3"
-                          >
-
-                            <span className="mt-1 text-cyan-400">
-                              →
-                            </span>
-
-                            <p className="text-sm text-slate-300">
-                              {action}
-                            </p>
-
-                          </div>
-
-                        )
-                      )
-
-                    ) : (
-
-                      <p className="text-sm text-slate-500">
-                        No recommended actions available.
-                      </p>
-
-                    )}
-
-                  </div>
-
-                </div>
-
-              </div>
-
-            </div>
-
-          </section>
-
         )}
 
 
-        {/* ====================================================
-            EVENT TIMELINE
-        ==================================================== */}
+        {/* RECOMMENDED ACTIONS */}
 
-        <section className="mt-8">
+        {threatSummary.recommended_actions?.length > 0 && (
 
-          <div className="rounded-xl border border-slate-800 bg-slate-900">
+          <div>
 
-            <div className="border-b border-slate-800 p-6">
-
-              <div className="flex items-center justify-between">
-
-                <div>
-
-                  <h2 className="text-lg font-semibold">
-                    Event Timeline
-                  </h2>
-
-                  <p className="mt-1 text-sm text-slate-400">
-                    Recent security events collected by Sentinel
-                  </p>
-
-                </div>
+            <p className="mb-3 text-xs font-semibold uppercase tracking-wider text-slate-500">
+              Recommended Actions
+            </p>
 
 
-                <span
-                  className={`rounded-md px-3 py-1 text-xs ${
-                    websocketConnected
-                      ? "bg-green-500/10 text-green-400"
-                      : "bg-yellow-500/10 text-yellow-400"
-                  }`}
-                >
+            <div className="space-y-2">
 
-                  {websocketConnected
-                    ? "LIVE"
-                    : "CONNECTING"
-                  }
+              {threatSummary.recommended_actions.map(
+                (action, index) => (
 
-                </span>
+                  <div
+                    key={index}
+                    className="rounded-lg border border-cyan-500/10 bg-cyan-500/5 px-4 py-3 text-sm text-slate-300"
+                  >
 
-              </div>
+                    <span className="mr-2 text-cyan-400">
+                      →
+                    </span>
+
+                    {action}
+
+                  </div>
+
+                )
+              )}
 
             </div>
-
-
-            {events.length === 0 ? (
-
-              <div className="p-8 text-center text-slate-400">
-                No events available.
-              </div>
-
-            ) : (
-
-              <div className="relative p-6">
-
-                <div className="absolute bottom-6 left-10 top-6 w-px bg-slate-800"></div>
-
-
-                <div className="space-y-7">
-
-                  {events.map(
-                    (event, index) => (
-
-                      <div
-                        key={index}
-                        className="relative flex gap-5"
-                      >
-
-                        <div className="relative z-10 mt-1 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-slate-700 bg-slate-900">
-
-                          <span
-                            className={`h-2 w-2 rounded-full ${
-                              event.event_type ===
-                              "authentication_failure"
-                                ? "bg-red-400"
-                                : event.event_type ===
-                                  "authentication_success"
-                                ? "bg-green-400"
-                                : "bg-cyan-400"
-                            }`}
-                          />
-
-                        </div>
-
-
-                        <div className="flex-1 rounded-lg border border-slate-800 bg-slate-950 p-4">
-
-                          <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-
-                            <div>
-
-                              <div className="flex flex-wrap items-center gap-3">
-
-                                <p className="font-medium">
-                                  {getEventLabel(event)}
-                                </p>
-
-
-                                <span
-                                  className={`rounded-md px-2 py-1 text-xs ${getEventStatusStyle(event)}`}
-                                >
-                                  {event.status || "EVENT"}
-                                </span>
-
-                              </div>
-
-
-                              <div className="mt-2 flex flex-wrap gap-4 text-sm text-slate-400">
-
-                                {event.source_ip && (
-
-                                  <span>
-                                    Source:{" "}
-                                    {event.source_ip}
-                                  </span>
-
-                                )}
-
-
-                                {event.username && (
-
-                                  <span>
-                                    User:{" "}
-                                    {event.username}
-                                  </span>
-
-                                )}
-
-
-                                {event.destination_port && (
-
-                                  <span>
-                                    Port:{" "}
-                                    {event.destination_port}
-                                  </span>
-
-                                )}
-
-                              </div>
-
-                            </div>
-
-
-                            <div className="text-xs text-slate-500">
-
-                              {formatTimestamp(
-                                event.timestamp
-                              )}
-
-                            </div>
-
-                          </div>
-
-
-                          {event.message && (
-
-                            <div className="mt-3 rounded-md bg-slate-900 px-3 py-2">
-
-                              <p className="font-mono text-xs text-slate-500">
-                                {event.message}
-                              </p>
-
-                            </div>
-
-                          )}
-
-                        </div>
-
-                      </div>
-
-                    )
-                  )}
-
-                </div>
-
-              </div>
-
-            )}
 
           </div>
 
-        </section>
+        )}
+
+      </div>
+
+    )}
+
+  </div>
+
+</section>
 
 
-        {/* ====================================================
-            SECURITY ALERTS
-        ==================================================== */}
+{/* ============================================================
+   LOG ANALYZER
+============================================================ */}
 
-        <section className="mt-8">
+<section className="mt-8">
 
-          <div className="rounded-xl border border-slate-800 bg-slate-900">
+  <div className="rounded-xl border border-slate-800 bg-slate-900 p-6">
 
-            <div className="border-b border-slate-800 p-6">
+    <div className="mb-6">
 
-              <h2 className="text-lg font-semibold">
-                Security Alerts
-              </h2>
+      <h2 className="text-xl font-semibold">
+        Security Log Analyzer
+      </h2>
 
-              <p className="mt-1 text-sm text-slate-400">
-                Detected threats from the Sentinel detection engine
-              </p>
+      <p className="mt-1 text-sm text-slate-400">
+        Upload a security log file for threat detection
+        and automated analysis.
+      </p>
+
+    </div>
+
+
+    <div className="rounded-xl border border-dashed border-slate-700 bg-slate-950 p-8">
+
+      <div className="text-center">
+
+        <div className="mb-4 text-4xl">
+          📄
+        </div>
+
+
+        <p className="text-sm font-medium text-slate-300">
+          Select Security Log File
+        </p>
+
+
+        <p className="mt-1 text-xs text-slate-500">
+          Supported format: plain text log files
+        </p>
+
+
+        <div className="mt-6 flex flex-col items-center gap-4">
+
+
+          <label className="cursor-pointer rounded-lg border border-slate-700 bg-slate-900 px-5 py-3 text-sm font-medium text-slate-300 transition hover:border-cyan-500 hover:text-cyan-400">
+
+            SELECT LOG FILE
+
+            <input
+              type="file"
+              accept=".log,.txt"
+              className="hidden"
+              onChange={(event) => {
+
+                const file =
+                  event.target.files?.[0]
+
+                setSelectedFile(
+                  file || null
+                )
+
+                setUploadMessage("")
+
+              }}
+            />
+
+          </label>
+
+
+          {selectedFile && (
+
+            <div className="text-sm text-cyan-400">
+
+              Selected:
+              {" "}
+              {selectedFile.name}
 
             </div>
 
-
-            {/* SEARCH + FILTER */}
-
-            <div className="flex flex-col gap-4 border-b border-slate-800 p-6 md:flex-row">
-
-              <input
-                type="text"
-                placeholder="Search IP, alert type or username..."
-                value={search}
-                onChange={(event) =>
-                  setSearch(event.target.value)
-                }
-                className="flex-1 rounded-lg border border-slate-700 bg-slate-950 px-4 py-3 text-sm text-white outline-none placeholder:text-slate-500 focus:border-slate-500"
-              />
+          )}
 
 
-              <select
-                value={severityFilter}
-                onChange={(event) =>
-                  setSeverityFilter(event.target.value)
-                }
-                className="rounded-lg border border-slate-700 bg-slate-950 px-4 py-3 text-sm text-white outline-none"
-              >
-
-                <option value="ALL">
-                  All Severities
-                </option>
-
-                <option value="HIGH">
-                  High
-                </option>
-
-                <option value="MEDIUM">
-                  Medium
-                </option>
-
-              </select>
-
-            </div>
-
-
-            {/* ALERT LIST */}
-
-            {loading ? (
-
-              <div className="p-6 text-slate-400">
-                Loading alerts...
-              </div>
-
-            ) : filteredAlerts.length === 0 ? (
-
-              <div className="p-8 text-center text-slate-400">
-                No alerts match your search or filter.
-              </div>
-
-            ) : (
-
-              <div className="divide-y divide-slate-800">
-
-                {filteredAlerts.map(
-                  (alert, index) => (
-
-                    <button
-                      key={
-                        alert._id ||
-                        index
-                      }
-                      onClick={() =>
-                        setSelectedAlert(alert)
-                      }
-                      className="flex w-full items-center justify-between p-6 text-left transition hover:bg-slate-800/50"
-                    >
-
-                      <div>
-
-                        <div className="flex flex-wrap items-center gap-3">
-
-                          <p className="font-medium">
-                            {alert.alert_type}
-                          </p>
-
-
-                          <span
-                            className={`rounded-md px-2 py-1 text-xs ${
-                              alert.severity === "HIGH"
-                                ? "bg-red-500/10 text-red-400"
-                                : "bg-yellow-500/10 text-yellow-400"
-                            }`}
-                          >
-                            {alert.severity}
-                          </span>
-
-
-                          <span
-                            className={`rounded-md px-2 py-1 text-xs ${getAlertStatusStyle(
-                              alert.status
-                            )}`}
-                          >
-                            {alert.status ||
-                              "DETECTED"}
-                          </span>
-
-                        </div>
-
-
-                        <p className="mt-2 text-sm text-slate-400">
-                          Source:{" "}
-                          {alert.source_ip}
-                        </p>
-
-
-                        <div className="mt-2 flex flex-wrap gap-4 text-xs text-slate-500">
-
-                          {alert.username && (
-
-                            <span>
-                              User:{" "}
-                              {alert.username}
-                            </span>
-
-                          )}
-
-
-                          <span>
-                            Detected:{" "}
-                            {formatTimestamp(
-                              alert.detected_at
-                            )}
-                          </span>
-
-                        </div>
-
-                      </div>
-
-
-                      <span className="text-slate-500">
-                        →
-                      </span>
-
-                    </button>
-
-                  )
-                )}
-
-              </div>
-
-            )}
-
-          </div>
-
-        </section>
-
-
-        {/* ====================================================
-            ALERT DETAILS MODAL
-        ==================================================== */}
-
-        {selectedAlert && (
-
-          <div
-            className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6"
-            onClick={() =>
-              setSelectedAlert(null)
+          <button
+            type="button"
+            onClick={analyzeLogFile}
+            disabled={
+              !selectedFile ||
+              uploading
             }
+            className="rounded-lg bg-cyan-500 px-6 py-3 text-sm font-semibold text-slate-950 transition hover:bg-cyan-400 disabled:cursor-not-allowed disabled:opacity-40"
           >
 
+            {uploading
+              ? "ANALYZING..."
+              : "ANALYZE LOG"
+            }
+
+          </button>
+
+
+          {uploadMessage && (
+
             <div
-              className="w-full max-w-lg rounded-xl border border-slate-700 bg-slate-900"
-              onClick={(event) =>
-                event.stopPropagation()
-              }
+              className={`rounded-lg border px-4 py-3 text-sm ${
+                uploadMessage.startsWith(
+                  "Analysis complete"
+                )
+                  ? "border-green-500/20 bg-green-500/10 text-green-400"
+                  : uploadMessage.startsWith(
+                      "Analyzing"
+                    )
+                    ? "border-cyan-500/20 bg-cyan-500/10 text-cyan-400"
+                    : "border-red-500/20 bg-red-500/10 text-red-400"
+              }`}
             >
 
+              {uploadMessage}
 
-              {/* MODAL HEADER */}
+            </div>
 
-              <div className="flex items-center justify-between border-b border-slate-800 p-6">
+          )}
 
-                <div>
+        </div>
+
+      </div>
+
+    </div>
+
+  </div>
+
+</section>
+
+
+{/* ============================================================
+   ALERTS
+============================================================ */}
+
+<section className="mt-8">
+
+  <div className="rounded-xl border border-slate-800 bg-slate-900">
+
+
+    {/* ALERT HEADER */}
+
+    <div className="border-b border-slate-800 p-6">
+
+      <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
+
+        <div>
+
+          <h2 className="text-xl font-semibold">
+            Security Alerts
+          </h2>
+
+          <p className="mt-1 text-sm text-slate-400">
+            Detected security incidents and threat activity
+          </p>
+
+        </div>
+
+
+        {/* FILTERS */}
+
+        <div className="flex flex-col gap-3 sm:flex-row">
+
+
+          {/* SEARCH */}
+
+          <input
+            type="text"
+            value={search}
+            onChange={(event) =>
+              setSearch(
+                event.target.value
+              )
+            }
+            placeholder="Search alerts..."
+            className="rounded-lg border border-slate-700 bg-slate-950 px-4 py-2 text-sm text-white outline-none placeholder:text-slate-600 focus:border-cyan-400"
+          />
+
+
+          {/* SEVERITY */}
+
+          <select
+            value={severityFilter}
+            onChange={(event) =>
+              setSeverityFilter(
+                event.target.value
+              )
+            }
+            className="rounded-lg border border-slate-700 bg-slate-950 px-4 py-2 text-sm text-slate-300 outline-none focus:border-cyan-400"
+          >
+
+            <option value="ALL">
+              ALL SEVERITIES
+            </option>
+
+            <option value="HIGH">
+              HIGH
+            </option>
+
+            <option value="MEDIUM">
+              MEDIUM
+            </option>
+
+            <option value="LOW">
+              LOW
+            </option>
+
+          </select>
+          {/* STATUS */}
+
+<select
+  value={statusFilter}
+  onChange={(event) =>
+    setStatusFilter(
+      event.target.value
+    )
+  }
+  className="rounded-lg border border-slate-700 bg-slate-950 px-4 py-2 text-sm text-slate-300 outline-none focus:border-cyan-400"
+>
+
+  <option value="ALL">
+    ALL STATUS
+  </option>
+
+  <option value="DETECTED">
+    DETECTED
+  </option>
+
+  <option value="INVESTIGATING">
+    INVESTIGATING
+  </option>
+
+  <option value="RESOLVED">
+    RESOLVED
+  </option>
+
+</select>
+
+        </div>
+
+      </div>
+
+    </div>
+
+
+    {/* ALERT LIST */}
+
+    <div className="divide-y divide-slate-800">
+
+      {filteredAlerts.length === 0 ? (
+
+        <div className="p-8 text-center text-sm text-slate-500">
+
+          No alerts match the current filters.
+
+        </div>
+
+      ) : (
+
+        filteredAlerts.map(
+          (alert) => (
+
+            <div
+              key={alert._id}
+              className="p-6 transition hover:bg-slate-950/50"
+            >
+
+              <div className="flex flex-col gap-5 xl:flex-row xl:items-center xl:justify-between">
+
+
+                {/* ALERT INFORMATION */}
+
+                <div className="min-w-0 flex-1">
 
                   <div className="flex flex-wrap items-center gap-3">
 
-                    <h2 className="text-xl font-semibold">
-                      {selectedAlert.alert_type}
-                    </h2>
+                    <h3 className="font-semibold text-white">
+
+                      {alert.alert_type ||
+                        "Unknown Alert"}
+
+                    </h3>
 
 
                     <span
-                      className={`rounded-md px-2 py-1 text-xs ${getAlertStatusStyle(
-                        selectedAlert.status
+                      className={`rounded-full px-3 py-1 text-xs font-semibold ${
+                        alert.severity === "HIGH"
+                          ? "bg-red-500/10 text-red-400"
+                          : alert.severity === "MEDIUM"
+                            ? "bg-yellow-500/10 text-yellow-400"
+                            : "bg-green-500/10 text-green-400"
+                      }`}
+                    >
+
+                      {alert.severity}
+
+                    </span>
+
+
+                    <span
+                      className={`rounded-full px-3 py-1 text-xs font-semibold ${getAlertStatusStyle(
+                        alert.status
                       )}`}
                     >
-                      {selectedAlert.status ||
-                        "DETECTED"}
+
+                      {alert.status}
+
                     </span>
 
                   </div>
 
 
-                  <p className="mt-1 text-sm text-slate-400">
-                    Security Alert Details
-                  </p>
+                  <div className="mt-4 grid grid-cols-1 gap-3 text-sm md:grid-cols-3">
 
-                </div>
+                    <div>
 
+                      <p className="text-xs text-slate-600">
+                        SOURCE IP
+                      </p>
 
-                <button
-                  onClick={() =>
-                    setSelectedAlert(null)
-                  }
-                  className="text-slate-400 hover:text-white"
-                >
-                  ✕
-                </button>
+                      <p className="mt-1 font-mono text-slate-300">
+                        {alert.source_ip ||
+                          "Unknown"}
+                      </p>
 
-              </div>
+                    </div>
 
 
-              {/* MODAL CONTENT */}
+                    <div>
 
-              <div className="max-h-[80vh] space-y-5 overflow-y-auto p-6">
+                      <p className="text-xs text-slate-600">
+                        DETECTED
+                      </p>
 
+                      <p className="mt-1 text-slate-300">
+                        {formatTimestamp(
+                          alert.detected_at ||
+                          alert.timestamp
+                        )}
+                      </p>
 
-                <div>
-
-                  <p className="text-sm text-slate-400">
-                    Severity
-                  </p>
-
-                  <p
-                    className={`mt-1 font-medium ${
-                      selectedAlert.severity ===
-                      "HIGH"
-                        ? "text-red-400"
-                        : "text-yellow-400"
-                    }`}
-                  >
-                    {selectedAlert.severity}
-                  </p>
-
-                </div>
+                    </div>
 
 
-                <div>
+                    <div>
 
-                  <p className="text-sm text-slate-400">
-                    Source IP
-                  </p>
+                      <p className="text-xs text-slate-600">
+                        ALERT ID
+                      </p>
 
-                  <p className="mt-1 font-medium">
-                    {selectedAlert.source_ip}
-                  </p>
+                      <p className="mt-1 truncate font-mono text-xs text-slate-500">
+                        {alert._id}
+                      </p>
 
-                </div>
-
-
-                {selectedAlert.username && (
-
-                  <div>
-
-                    <p className="text-sm text-slate-400">
-                      Username
-                    </p>
-
-                    <p className="mt-1 font-medium">
-                      {selectedAlert.username}
-                    </p>
+                    </div>
 
                   </div>
-
-                )}
-
-
-                {selectedAlert.failed_attempts && (
-
-                  <div>
-
-                    <p className="text-sm text-slate-400">
-                      Failed Attempts
-                    </p>
-
-                    <p className="mt-1 font-medium">
-                      {selectedAlert.failed_attempts}
-                    </p>
-
-                  </div>
-
-                )}
-
-
-                {selectedAlert.window_minutes && (
-
-                  <div>
-
-                    <p className="text-sm text-slate-400">
-                      Detection Window
-                    </p>
-
-                    <p className="mt-1 font-medium">
-                      {selectedAlert.window_minutes} minutes
-                    </p>
-
-                  </div>
-
-                )}
-
-
-                {selectedAlert.ports_scanned && (
-
-                  <div>
-
-                    <p className="text-sm text-slate-400">
-                      Ports Scanned
-                    </p>
-
-                    <p className="mt-1 font-medium">
-                      {selectedAlert.ports_scanned}
-                    </p>
-
-                  </div>
-
-                )}
-
-
-                {selectedAlert.first_seen && (
-
-                  <div>
-
-                    <p className="text-sm text-slate-400">
-                      First Seen
-                    </p>
-
-                    <p className="mt-1 font-medium">
-                      {formatTimestamp(
-                        selectedAlert.first_seen
-                      )}
-                    </p>
-
-                  </div>
-
-                )}
-
-
-                {selectedAlert.last_seen && (
-
-                  <div>
-
-                    <p className="text-sm text-slate-400">
-                      Last Seen
-                    </p>
-
-                    <p className="mt-1 font-medium">
-                      {formatTimestamp(
-                        selectedAlert.last_seen
-                      )}
-                    </p>
-
-                  </div>
-
-                )}
-
-
-                {selectedAlert.timestamp && (
-
-                  <div>
-
-                    <p className="text-sm text-slate-400">
-                      Event Timestamp
-                    </p>
-
-                    <p className="mt-1 font-medium">
-                      {formatTimestamp(
-                        selectedAlert.timestamp
-                      )}
-                    </p>
-
-                  </div>
-
-                )}
-
-
-                <div>
-
-                  <p className="text-sm text-slate-400">
-                    Detected At
-                  </p>
-
-                  <p className="mt-1 font-medium text-cyan-400">
-                    {formatTimestamp(
-                      selectedAlert.detected_at
-                    )}
-                  </p>
-
-                </div>
-
-
-                <div>
-
-                  <p className="text-sm text-slate-400">
-                    Current Status
-                  </p>
-
-                  <p
-                    className={`mt-1 font-medium ${
-                      selectedAlert.status ===
-                      "RESOLVED"
-                        ? "text-green-400"
-                        : selectedAlert.status ===
-                          "INVESTIGATING"
-                        ? "text-blue-400"
-                        : "text-red-400"
-                    }`}
-                  >
-                    {selectedAlert.status ||
-                      "DETECTED"}
-                  </p>
 
                 </div>
 
 
                 {/* ACTIONS */}
 
-                <div className="border-t border-slate-800 pt-5">
-
-                  <p className="mb-3 text-sm text-slate-400">
-                    Investigation Actions
-                  </p>
+                <div className="flex flex-wrap gap-2">
 
 
-                  <div className="flex flex-col gap-3 sm:flex-row">
+                  <button
+                    type="button"
+                    onClick={() => {
+                       setSelectedAlert(alert)
+                       fetchAlertActivity(alert._id)
+                    }}
+                    className="rounded-lg border border-slate-700 bg-slate-950 px-4 py-2 text-xs font-medium text-slate-300 transition hover:border-cyan-500 hover:text-cyan-400"
+                  >
+                    VIEW
+                  </button>
 
-                    <button
-                      onClick={() =>
-                        updateAlertStatus(
-                          selectedAlert._id,
-                          "INVESTIGATING"
-                        )
-                      }
-                      disabled={
-                        selectedAlert.status ===
-                        "INVESTIGATING"
-                      }
-                      className="flex-1 rounded-lg border border-blue-900 bg-blue-500/10 px-4 py-3 text-sm font-medium text-blue-400 transition hover:bg-blue-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+
+                 {alert.status === "DETECTED" && (
+
+  <button
+    type="button"
+    onClick={() =>
+      updateAlertStatus(
+        alert._id,
+        "INVESTIGATING"
+      )
+    }
+    className="rounded-lg border border-yellow-500/30 bg-yellow-500/10 px-4 py-2 text-xs font-medium text-yellow-400 transition hover:bg-yellow-500/20"
+  >
+    START INVESTIGATION
+  </button>
+
+)}
+
+
+{alert.status === "INVESTIGATING" && (
+
+  <button
+    type="button"
+    onClick={() =>
+      updateAlertStatus(
+        alert._id,
+        "RESOLVED"
+      )
+    }
+    className="rounded-lg border border-green-500/30 bg-green-500/10 px-4 py-2 text-xs font-medium text-green-400 transition hover:bg-green-500/20"
+  >
+    MARK AS RESOLVED
+  </button>
+
+)}
+
+
+{alert.status === "RESOLVED" && (
+
+  <button
+    type="button"
+    onClick={() =>
+      updateAlertStatus(
+        alert._id,
+        "INVESTIGATING"
+      )
+    }
+    className="rounded-lg border border-yellow-500/30 bg-yellow-500/10 px-4 py-2 text-xs font-medium text-yellow-400 transition hover:bg-yellow-500/20"
+  >
+    REOPEN INVESTIGATION
+  </button>
+
+)}
+                </div>
+
+              </div>
+
+            </div>
+
+          )
+        )
+
+      )}
+
+    </div>
+
+  </div>
+
+</section>
+{/* ============================================================
+   EVENT TIMELINE
+============================================================ */}
+
+<section className="mt-8">
+
+  <div className="rounded-xl border border-slate-800 bg-slate-900">
+
+
+    {/* EVENT HEADER */}
+
+    <div className="border-b border-slate-800 p-6">
+
+      <div className="flex items-center justify-between">
+
+        <div>
+
+          <h2 className="text-xl font-semibold">
+            Event Timeline
+          </h2>
+
+          <p className="mt-1 text-sm text-slate-400">
+            Recent security events processed by Sentinel
+          </p>
+
+        </div>
+
+
+        <div className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-500">
+
+          {events.length} EVENTS
+
+        </div>
+
+      </div>
+
+    </div>
+
+
+    {/* EVENT LIST */}
+
+    <div className="divide-y divide-slate-800">
+
+      {events.length === 0 ? (
+
+        <div className="p-8 text-center text-sm text-slate-500">
+
+          No security events available.
+
+        </div>
+
+      ) : (
+
+        events.map(
+          (event, index) => (
+
+            <div
+              key={
+                event._id ||
+                `${event.timestamp}-${index}`
+              }
+              className="p-6 transition hover:bg-slate-950/50"
+            >
+
+              <div className="flex items-start gap-4">
+
+
+                {/* EVENT INDICATOR */}
+
+                <div
+                  className={`mt-1 flex h-9 w-9 shrink-0 items-center justify-center rounded-full ${
+                    event.event_type ===
+                    "authentication_failure"
+
+                      ? "bg-red-500/10"
+
+                      : event.event_type ===
+                        "authentication_success"
+
+                        ? "bg-green-500/10"
+
+                        : event.event_type ===
+                          "network_connection"
+
+                          ? "bg-cyan-500/10"
+
+                          : "bg-slate-500/10"
+                  }`}
+                >
+
+                  <span
+                    className={`text-sm ${
+                      event.event_type ===
+                      "authentication_failure"
+
+                        ? "text-red-400"
+
+                        : event.event_type ===
+                          "authentication_success"
+
+                          ? "text-green-400"
+
+                          : event.event_type ===
+                            "network_connection"
+
+                            ? "text-cyan-400"
+
+                            : "text-slate-400"
+                    }`}
+                  >
+
+                    {event.event_type ===
+                    "authentication_failure"
+
+                      ? "!"
+
+                      : event.event_type ===
+                        "authentication_success"
+
+                        ? "✓"
+
+                        : event.event_type ===
+                          "network_connection"
+
+                          ? "↔"
+
+                          : "•"}
+
+                  </span>
+
+                </div>
+
+
+                {/* EVENT CONTENT */}
+
+                <div className="min-w-0 flex-1">
+
+                  <div className="flex flex-wrap items-center gap-3">
+
+                    <h3 className="text-sm font-semibold text-slate-200">
+
+                      {getEventLabel(event)}
+
+                    </h3>
+
+
+                    <span
+                      className={`rounded-full px-2.5 py-1 text-xs font-medium ${getEventStatusStyle(
+                        event
+                      )}`}
                     >
-                      START INVESTIGATION
-                    </button>
 
+                      {event.status ||
+                        "EVENT"}
 
-                    <button
-                      onClick={() =>
-                        updateAlertStatus(
-                          selectedAlert._id,
-                          "RESOLVED"
-                        )
-                      }
-                      disabled={
-                        selectedAlert.status ===
-                        "RESOLVED"
-                      }
-                      className="flex-1 rounded-lg border border-green-900 bg-green-500/10 px-4 py-3 text-sm font-medium text-green-400 transition hover:bg-green-500/20 disabled:cursor-not-allowed disabled:opacity-40"
-                    >
-                      RESOLVE ALERT
-                    </button>
+                    </span>
 
                   </div>
+
+
+                  <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-3">
+
+
+                    {/* SOURCE IP */}
+
+                    {event.source_ip && (
+
+                      <div>
+
+                        <p className="text-xs text-slate-600">
+                          SOURCE IP
+                        </p>
+
+                        <p className="mt-1 font-mono text-sm text-slate-400">
+                          {event.source_ip}
+                        </p>
+
+                      </div>
+
+                    )}
+
+
+                    {/* USERNAME */}
+
+                    {event.username && (
+
+                      <div>
+
+                        <p className="text-xs text-slate-600">
+                          USERNAME
+                        </p>
+
+                        <p className="mt-1 text-sm text-slate-400">
+                          {event.username}
+                        </p>
+
+                      </div>
+
+                    )}
+
+
+                    {/* DESTINATION PORT */}
+
+                    {event.destination_port && (
+
+                      <div>
+
+                        <p className="text-xs text-slate-600">
+                          DESTINATION PORT
+                        </p>
+
+                        <p className="mt-1 font-mono text-sm text-slate-400">
+                          {event.destination_port}
+                        </p>
+
+                      </div>
+
+                    )}
+
+                  </div>
+
+
+                  {/* RAW MESSAGE */}
+
+                  {event.message && (
+
+                    <div className="mt-4 rounded-lg border border-slate-800 bg-slate-950 px-4 py-3">
+
+                      <p className="font-mono text-xs leading-5 text-slate-500 break-all">
+
+                        {event.message}
+
+                      </p>
+
+                    </div>
+
+                  )}
+
+
+                  {/* TIMESTAMP */}
+
+                  <p className="mt-3 text-xs text-slate-600">
+
+                    {formatTimestamp(
+                      event.timestamp
+                    )}
+
+                  </p>
 
                 </div>
 
@@ -2393,17 +2728,817 @@ function App() {
 
             </div>
 
+          )
+        )
+
+      )}
+
+    </div>
+
+  </div>
+
+</section>
+
+
+{/* ============================================================
+   ALERT DETAILS MODAL
+============================================================ */}
+
+{selectedAlert && (
+
+  <div
+    className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-6 backdrop-blur-sm"
+    onClick={() =>
+      setSelectedAlert(null)
+    }
+  >
+
+    <div
+      className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-2xl border border-slate-700 bg-slate-900 shadow-2xl"
+      onClick={(event) =>
+        event.stopPropagation()
+      }
+    >
+
+
+      {/* ======================================================
+          MODAL HEADER
+      ====================================================== */}
+
+      <div className="flex items-center justify-between border-b border-slate-800 p-6">
+
+        <div>
+
+          <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+            Security Alert
+          </p>
+
+          <h2 className="mt-1 text-xl font-semibold text-white">
+
+            {selectedAlert.alert_type ||
+              "Unknown Alert"}
+
+          </h2>
+
+        </div>
+
+
+        <button
+          type="button"
+          onClick={() =>
+            setSelectedAlert(null)
+          }
+          className="flex h-9 w-9 items-center justify-center rounded-lg border border-slate-700 text-slate-400 transition hover:border-slate-500 hover:text-white"
+        >
+
+          ✕
+
+        </button>
+
+      </div>
+
+
+      {/* ======================================================
+          MODAL BODY
+      ====================================================== */}
+
+      <div className="space-y-6 p-6">
+
+
+        {/* SEVERITY + STATUS */}
+
+        <div className="flex flex-wrap gap-3">
+
+          <span
+            className={`rounded-full px-3 py-1.5 text-xs font-semibold ${
+              selectedAlert.severity === "HIGH"
+                ? "bg-red-500/10 text-red-400"
+                : selectedAlert.severity === "MEDIUM"
+                  ? "bg-yellow-500/10 text-yellow-400"
+                  : "bg-green-500/10 text-green-400"
+            }`}
+          >
+
+            SEVERITY:
+            {" "}
+            {selectedAlert.severity}
+
+          </span>
+
+
+          <span
+            className={`rounded-full px-3 py-1.5 text-xs font-semibold ${getAlertStatusStyle(
+              selectedAlert.status
+            )}`}
+          >
+
+            STATUS:
+            {" "}
+            {selectedAlert.status}
+
+          </span>
+
+        </div>
+
+
+        {/* DETAILS GRID */}
+
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+
+
+          {/* SOURCE IP */}
+
+          <div className="rounded-xl border border-slate-800 bg-slate-950 p-4">
+
+            <p className="text-xs uppercase tracking-wider text-slate-600">
+              Source IP
+            </p>
+
+            <p className="mt-2 font-mono text-sm text-slate-300">
+
+              {selectedAlert.source_ip ||
+                "Unknown"}
+
+            </p>
+
+          </div>
+
+
+          {/* USERNAME */}
+
+          <div className="rounded-xl border border-slate-800 bg-slate-950 p-4">
+
+            <p className="text-xs uppercase tracking-wider text-slate-600">
+              Username
+            </p>
+
+            <p className="mt-2 text-sm text-slate-300">
+
+              {selectedAlert.username ||
+                "N/A"}
+
+            </p>
+
+          </div>
+
+
+          {/* FAILED ATTEMPTS */}
+
+          {selectedAlert.failed_attempts !==
+            undefined && (
+
+            <div className="rounded-xl border border-slate-800 bg-slate-950 p-4">
+
+              <p className="text-xs uppercase tracking-wider text-slate-600">
+                Failed Attempts
+              </p>
+
+              <p className="mt-2 text-sm text-slate-300">
+
+                {selectedAlert.failed_attempts}
+
+              </p>
+
+            </div>
+
+          )}
+
+
+          {/* PORTS SCANNED */}
+
+          {selectedAlert.ports_scanned !==
+            undefined && (
+
+            <div className="rounded-xl border border-slate-800 bg-slate-950 p-4">
+
+              <p className="text-xs uppercase tracking-wider text-slate-600">
+                Ports Scanned
+              </p>
+
+              <p className="mt-2 text-sm text-slate-300">
+
+                {selectedAlert.ports_scanned}
+
+              </p>
+
+            </div>
+
+          )}
+
+
+          {/* WINDOW */}
+
+          {selectedAlert.window_minutes !==
+            undefined && (
+
+            <div className="rounded-xl border border-slate-800 bg-slate-950 p-4">
+
+              <p className="text-xs uppercase tracking-wider text-slate-600">
+                Detection Window
+              </p>
+
+              <p className="mt-2 text-sm text-slate-300">
+
+                {selectedAlert.window_minutes}
+                {" "}
+                minutes
+
+              </p>
+
+            </div>
+
+          )}
+
+
+          {/* DETECTED AT */}
+
+          <div className="rounded-xl border border-slate-800 bg-slate-950 p-4">
+
+            <p className="text-xs uppercase tracking-wider text-slate-600">
+              Detected At
+            </p>
+
+            <p className="mt-2 text-sm text-slate-300">
+
+              {formatTimestamp(
+                selectedAlert.detected_at ||
+                selectedAlert.timestamp
+              )}
+
+            </p>
+
+          </div>
+
+        </div>
+
+
+        {/* FIRST / LAST SEEN */}
+
+        {(selectedAlert.first_seen ||
+          selectedAlert.last_seen) && (
+
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+
+            {selectedAlert.first_seen && (
+
+              <div className="rounded-xl border border-slate-800 bg-slate-950 p-4">
+
+                <p className="text-xs uppercase tracking-wider text-slate-600">
+                  First Seen
+                </p>
+
+                <p className="mt-2 text-sm text-slate-300">
+
+                  {formatTimestamp(
+                    selectedAlert.first_seen
+                  )}
+
+                </p>
+
+              </div>
+
+            )}
+
+
+            {selectedAlert.last_seen && (
+
+              <div className="rounded-xl border border-slate-800 bg-slate-950 p-4">
+
+                <p className="text-xs uppercase tracking-wider text-slate-600">
+                  Last Seen
+                </p>
+
+                <p className="mt-2 text-sm text-slate-300">
+
+                  {formatTimestamp(
+                    selectedAlert.last_seen
+                  )}
+
+                </p>
+
+              </div>
+
+            )}
+
           </div>
 
         )}
 
-      </main>
+
+        {/* ALERT ID */}
+
+        <div className="rounded-xl border border-slate-800 bg-slate-950 p-4">
+
+          <p className="text-xs uppercase tracking-wider text-slate-600">
+            Alert ID
+          </p>
+
+          <p className="mt-2 break-all font-mono text-xs text-slate-500">
+
+            {selectedAlert._id}
+
+          </p>
+
+        </div>
+{/* ==================================================
+    THREAT CONTEXT
+================================================== */}
+
+<div className="rounded-xl border border-cyan-500/10 bg-cyan-500/[0.03] p-5">
+
+  <div className="mb-4">
+
+    <p className="text-xs font-semibold uppercase tracking-wider text-cyan-400">
+      Threat Context
+    </p>
+
+    <p className="mt-1 text-xs text-slate-600">
+      Security indicators associated with this alert.
+    </p>
+
+  </div>
+
+
+  <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+
+
+    {/* SOURCE */}
+
+    <div>
+
+      <p className="text-[11px] uppercase tracking-wider text-slate-600">
+        Source
+      </p>
+
+      <p className="mt-1 font-mono text-sm text-slate-300">
+        {selectedAlert.source_ip ||
+          "Unknown"}
+      </p>
 
     </div>
 
-  )
+
+    {/* EVENT TYPE */}
+
+    <div>
+
+      <p className="text-[11px] uppercase tracking-wider text-slate-600">
+        Event Type
+      </p>
+
+      <p className="mt-1 text-sm text-slate-300">
+        {selectedAlert.alert_type ||
+          "Unknown"}
+      </p>
+
+    </div>
+
+
+    {/* SEVERITY */}
+
+    <div>
+
+      <p className="text-[11px] uppercase tracking-wider text-slate-600">
+        Severity
+      </p>
+
+      <p className="mt-1 text-sm font-semibold text-slate-300">
+        {selectedAlert.severity ||
+          "UNKNOWN"}
+      </p>
+
+    </div>
+
+  </div>
+
+</div>
+        {/* ==================================================
+    INVESTIGATION ACTIVITY
+================================================== */}
+
+<div className="border-t border-slate-800 pt-5">
+
+  <div className="mb-4 flex items-center justify-between">
+
+    <div>
+
+      <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+        Investigation Activity
+      </p>
+
+      <p className="mt-1 text-xs text-slate-600">
+        Analyst actions recorded for this alert
+      </p>
+
+    </div>
+
+    {alertActivity.length > 0 && (
+
+      <span className="rounded-full bg-cyan-500/10 px-3 py-1 text-xs font-medium text-cyan-400">
+
+        {alertActivity.length}
+        {" "}
+        {alertActivity.length === 1
+          ? "EVENT"
+          : "EVENTS"}
+
+      </span>
+
+    )}
+
+  </div>
+
+
+  {activityLoading ? (
+
+    <div className="rounded-xl border border-slate-800 bg-slate-950 p-5">
+
+      <div className="flex items-center gap-3">
+
+        <div className="h-4 w-4 animate-spin rounded-full border-2 border-slate-700 border-t-cyan-400" />
+
+        <span className="text-sm text-slate-500">
+          Loading investigation activity...
+        </span>
+
+      </div>
+
+    </div>
+
+  ) : alertActivity.length === 0 ? (
+
+    <div className="rounded-xl border border-slate-800 bg-slate-950 p-5">
+
+      <p className="text-sm text-slate-500">
+        No investigation activity recorded yet.
+      </p>
+
+      <p className="mt-1 text-xs text-slate-600">
+        Status changes will appear here.
+      </p>
+
+    </div>
+
+  ) : (
+
+    <div className="space-y-3">
+
+      {alertActivity.map(
+        (activity, index) => (
+
+          <div
+            key={`${activity.timestamp}-${index}`}
+            className="relative rounded-xl border border-slate-800 bg-slate-950 p-4"
+          >
+
+            <div className="flex gap-4">
+
+
+              {/* ACTIVITY INDICATOR */}
+
+              <div className="flex shrink-0 flex-col items-center">
+
+                <div className="flex h-8 w-8 items-center justify-center rounded-full bg-cyan-500/10 text-cyan-400">
+
+                  {activity.action?.includes(
+                    "RESOLVED"
+                  )
+                    ? "✓"
+                    : activity.action?.includes(
+                        "INVESTIGATING"
+                      )
+                      ? "→"
+                      : "•"}
+
+                </div>
+
+                {index <
+                  alertActivity.length - 1 && (
+
+                  <div className="mt-2 h-full w-px bg-slate-800" />
+
+                )}
+
+              </div>
+
+
+              {/* ACTIVITY CONTENT */}
+
+              <div className="min-w-0 flex-1">
+
+                <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+
+                  <p className="text-sm font-medium text-slate-300">
+
+                    {activity.action}
+
+                  </p>
+
+                  <span className="text-xs text-slate-600">
+
+                    {formatTimestamp(
+                      activity.timestamp
+                    )}
+
+                  </span>
+
+                </div>
+
+
+                <div className="mt-2 flex flex-wrap items-center gap-3">
+
+                  <span className="text-xs text-slate-500">
+
+                    Analyst:
+                    {" "}
+
+                    <span className="text-slate-400">
+
+                      {activity.username ||
+                        "unknown"}
+
+                    </span>
+
+                  </span>
+
+                </div>
+
+
+                {activity.note && (
+
+                  <div className="mt-3 rounded-lg border border-slate-800 bg-slate-900 px-3 py-2">
+
+                    <p className="text-xs leading-5 text-slate-500">
+
+                      {activity.note}
+
+                    </p>
+
+                  </div>
+
+                )}
+
+              </div>
+
+            </div>
+
+          </div>
+
+        )
+      )}
+
+    </div>
+
+  )}
+
+</div>
+{/* ==================================================
+    ANALYST NOTES
+================================================== */}
+
+<div className="border-t border-slate-800 pt-5">
+
+  <div className="mb-4">
+
+    <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+      Analyst Notes
+    </p>
+
+    <p className="mt-1 text-xs text-slate-600">
+      Add investigation findings or observations.
+    </p>
+
+  </div>
+
+
+  <textarea
+    value={analystNote}
+    onChange={(event) => {
+      setAnalystNote(
+        event.target.value
+      )
+      setNoteMessage("")
+    }}
+    placeholder="Enter investigation notes..."
+    maxLength={1000}
+    rows={4}
+    className="w-full resize-none rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm leading-6 text-slate-300 outline-none placeholder:text-slate-600 focus:border-cyan-400"
+  />
+
+
+  <div className="mt-2 flex items-center justify-between">
+
+    <span className="text-xs text-slate-600">
+      {analystNote.length}/1000 characters
+    </span>
+
+
+    <button
+      type="button"
+      onClick={addAnalystNote}
+      disabled={
+        noteSubmitting ||
+        !analystNote.trim()
+      }
+      className="rounded-lg bg-cyan-500 px-4 py-2 text-xs font-semibold text-slate-950 transition hover:bg-cyan-400 disabled:cursor-not-allowed disabled:opacity-40"
+    >
+
+      {noteSubmitting
+        ? "ADDING..."
+        : "ADD NOTE"
+      }
+
+    </button>
+
+  </div>
+
+
+  {noteMessage && (
+
+    <div
+      className={`mt-3 rounded-lg border px-3 py-2 text-xs ${
+        noteMessage ===
+        "Investigation note added."
+          ? "border-green-500/20 bg-green-500/10 text-green-400"
+          : "border-red-500/20 bg-red-500/10 text-red-400"
+      }`}
+    >
+
+      {noteMessage}
+
+    </div>
+
+  )}
+
+</div>
+        {/* ==================================================
+    STATUS ACTIONS
+================================================== */}
+
+<div className="border-t border-slate-800 pt-5">
+
+  <div className="mb-4">
+
+    <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+      Investigation Status
+    </p>
+
+    <p className="mt-1 text-xs text-slate-600">
+      Update the current state of this security alert.
+    </p>
+
+  </div>
+
+
+  <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+
+
+    {/* DETECTED */}
+
+    <button
+      type="button"
+      onClick={() =>
+        updateAlertStatus(
+          selectedAlert._id,
+          "DETECTED"
+        )
+      }
+      disabled={
+        selectedAlert.status ===
+        "DETECTED"
+      }
+      className="rounded-xl border border-red-500/20 bg-red-500/[0.06] px-4 py-3 text-left transition hover:border-red-500/40 hover:bg-red-500/10 disabled:cursor-not-allowed disabled:opacity-30"
+    >
+
+      <p className="text-xs font-semibold text-red-400">
+        DETECTED
+      </p>
+
+      <p className="mt-1 text-[11px] text-slate-600">
+        Mark as newly detected
+      </p>
+
+    </button>
+
+
+    {/* INVESTIGATING */}
+
+    <button
+      type="button"
+      onClick={() =>
+        updateAlertStatus(
+          selectedAlert._id,
+          "INVESTIGATING"
+        )
+      }
+      disabled={
+        selectedAlert.status ===
+        "INVESTIGATING"
+      }
+      className="rounded-xl border border-blue-500/20 bg-blue-500/[0.06] px-4 py-3 text-left transition hover:border-blue-500/40 hover:bg-blue-500/10 disabled:cursor-not-allowed disabled:opacity-30"
+    >
+
+      <p className="text-xs font-semibold text-blue-400">
+        INVESTIGATING
+      </p>
+
+      <p className="mt-1 text-[11px] text-slate-600">
+        Begin investigation
+      </p>
+
+    </button>
+
+
+    {/* RESOLVED */}
+
+    <button
+      type="button"
+      onClick={() =>
+        updateAlertStatus(
+          selectedAlert._id,
+          "RESOLVED"
+        )
+      }
+      disabled={
+        selectedAlert.status ===
+        "RESOLVED"
+      }
+      className="rounded-xl border border-green-500/20 bg-green-500/[0.06] px-4 py-3 text-left transition hover:border-green-500/40 hover:bg-green-500/10 disabled:cursor-not-allowed disabled:opacity-30"
+    >
+
+      <p className="text-xs font-semibold text-green-400">
+        RESOLVED
+      </p>
+
+      <p className="mt-1 text-[11px] text-slate-600">
+        Close the investigation
+      </p>
+
+    </button>
+
+  </div>
+
+</div>
+
+      {/* ======================================================
+          MODAL FOOTER
+      ====================================================== */}
+
+      <div className="border-t border-slate-800 px-6 py-4">
+
+        <button
+          type="button"
+          onClick={() =>
+            setSelectedAlert(null)
+          }
+          className="w-full rounded-lg border border-slate-700 bg-slate-950 px-4 py-2.5 text-sm font-medium text-slate-300 transition hover:border-slate-500 hover:text-white"
+        >
+
+          CLOSE
+
+        </button>
+
+      </div>
+
+    </div>
+  </div>
+</div>
+
+)
+
+/* ============================================================
+   FOOTER
+============================================================ */}
+
+<footer className="border-t border-slate-800 px-8 py-6">
+
+  <div className="flex flex-col gap-2 text-center text-xs text-slate-600 md:flex-row md:items-center md:justify-between md:text-left">
+
+    <p>
+      SENTINEL Security Operations Platform
+    </p>
+
+    <p>
+      JWT Protected • MongoDB Atlas • Real-Time WebSocket Monitoring
+    </p>
+
+  </div>
+
+</footer>
+
+
+</main>
+
+</div>
+
+)
+
 
 }
 
+
+/* ============================================================
+   EXPORT
+============================================================ */
 
 export default App
