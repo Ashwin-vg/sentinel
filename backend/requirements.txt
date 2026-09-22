@@ -25,3 +25,4 @@ typing_extensions==4.16.0
 uvicorn==0.53.0
 motor==3.7.1
 motor==3.7.1
+passlib==1.7.4
