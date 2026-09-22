@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react"
 
-const API = "http://127.0.0.1:8000"
+const API = "https://sentinel-backend-us9m.onrender.com"
 
 
 /* ============================================================
@@ -571,7 +571,7 @@ useEffect(() => {
 
     websocket =
       new WebSocket(
-        "ws://127.0.0.1:8000/ws"
+        "wss://sentinel-backend-us9m.onrender.com/ws"
       )
 
 
