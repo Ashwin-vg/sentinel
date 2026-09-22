@@ -26,3 +26,4 @@ uvicorn==0.53.0
 motor==3.7.1
 motor==3.7.1
 passlib==1.7.4
+websockets==15.0.1
